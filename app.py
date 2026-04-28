@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 import os
 import gdown
-import time
 
 st.set_page_config(
     page_title="Сегментация костных метастазов",
@@ -34,12 +33,13 @@ MODEL_DRIVE_ID = "15vdWpMf86ylUgRV6TiW8xMtGd1cqEyuI"
 
 @st.cache_resource
 def load_model():
-    """Загружает модель один раз и кеширует"""
     model_path = "unet_best.pth"
     if not os.path.exists(model_path):
-        with st.spinner("Загружаем модель (около 100 МБ) с Google Диска..."):
-            url = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
-            gdown.download(url, model_path, quiet=False)
+        # Скачиваем без гифок, просто текст
+        st.info("Скачиваю модель с Google Диска (≈100 МБ)... подождите пару минут.")
+        url = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
+        gdown.download(url, model_path, quiet=False)
+        st.success("Модель загружена.")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = smp.UnetPlusPlus(
         encoder_name='resnet34',
@@ -47,12 +47,11 @@ def load_model():
         in_channels=3,
         classes=1
     ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     return model, device
 
 def remove_contour(dicom_bytes):
-    """Удаление зелёного контура врача"""
     dcm = pydicom.dcmread(BytesIO(dicom_bytes))
     img = dcm.pixel_array
     if len(img.shape) == 3:
@@ -67,7 +66,6 @@ def remove_contour(dicom_bytes):
     return cv2.inpaint(color_img, mask_contour, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 def remove_linear_artifacts(mask, max_aspect_ratio=6):
-    """Удаление артефактных линий"""
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     cleaned_mask = np.zeros_like(mask)
     for i in range(1, num_labels):
@@ -78,19 +76,19 @@ def remove_linear_artifacts(mask, max_aspect_ratio=6):
     return cleaned_mask
 
 def predict_sliding_window(image, model, device):
-    """Скользящее окно (без вложенных st-виджетов)"""
     h, w = image.shape[:2]
     prediction_map = np.zeros((h, w), dtype=np.float32)
     count_map = np.zeros((h, w), dtype=np.float32)
 
-    total_patches_y = (h - PATCH_SIZE) // STRIDE + 1
-    total_patches_x = (w - PATCH_SIZE) // STRIDE + 1
-    total = total_patches_y * total_patches_x
-
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-
+    total_y = (h - PATCH_SIZE) // STRIDE + 1
+    total_x = (w - PATCH_SIZE) // STRIDE + 1
+    total = total_y * total_x
     done = 0
+
+    # Только текст, без анимаций
+    status_text = st.empty()
+    status_text.text(f"Инференс: 0/{total} патчей")
+
     for y in range(0, h - PATCH_SIZE + 1, STRIDE):
         for x in range(0, w - PATCH_SIZE + 1, STRIDE):
             patch = image[y:y+PATCH_SIZE, x:x+PATCH_SIZE].astype(np.float32) / 255.0
@@ -102,16 +100,13 @@ def predict_sliding_window(image, model, device):
             count_map[y:y+PATCH_SIZE, x:x+PATCH_SIZE] += 1
             done += 1
             if done % 100 == 0:
-                progress_text.text(f"Инференс: {done}/{total} патчей")
-                progress_bar.progress(min(done / total, 1.0))
+                status_text.text(f"Инференс: {done}/{total} патчей")
 
-    progress_text.empty()
-    progress_bar.empty()
+    status_text.empty()
     prediction_map = np.divide(prediction_map, count_map, where=count_map>0)
     return prediction_map
 
 def calculate_bsi(pred_mask, h, w):
-    """Расчёт BSI по анатомическим зонам"""
     results = []
     total_pixels = 0
     total_meta = 0
@@ -132,7 +127,6 @@ def calculate_bsi(pred_mask, h, w):
     return results, total_bsi
 
 def create_overlay(image, pred_mask):
-    """Наложение красной маски и границ зон"""
     h, w = image.shape[:2]
     overlay = image.copy()
     mask_3d = np.stack([pred_mask / 255.0, np.zeros_like(pred_mask), np.zeros_like(pred_mask)], axis=2)
@@ -180,9 +174,11 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
+    # Загружаем модель один раз, потом используем кеш
     model, device = load_model()
 
-    # Чтение и предобработка
+    # Предобработка
+    st.info("Чтение DICOM, удаление контура врача...")
     dicom_bytes = uploaded_file.read()
     clean_img = remove_contour(dicom_bytes)
     h, w = clean_img.shape[:2]
@@ -190,6 +186,7 @@ if uploaded_file is not None:
     img_cropped = clean_img[CROP_TOP:h-CROP_BOTTOM, CROP_LEFT:w-right]
 
     # Инференс
+    st.info("Запуск нейросети U-Net++... пожалуйста, подождите (≈15–20 сек)")
     prob_map = predict_sliding_window(img_cropped, model, device)
 
     # Постобработка
@@ -202,7 +199,7 @@ if uploaded_file is not None:
     # BSI
     bsi_zones, total_bsi = calculate_bsi(pred_mask, h, w)
 
-    st.success("✅ Анализ завершён!")
+    st.success("Анализ завершён!")
 
     col1, col2 = st.columns([2, 1])
     with col1:
