@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 import os
 import gdown
+import time
 
 st.set_page_config(
     page_title="Сегментация костных метастазов",
@@ -33,9 +34,10 @@ MODEL_DRIVE_ID = "15vdWpMf86ylUgRV6TiW8xMtGd1cqEyuI"
 
 @st.cache_resource
 def load_model():
+    """Загружает модель один раз и кеширует"""
     model_path = "unet_best.pth"
     if not os.path.exists(model_path):
-        with st.spinner("Загружаем модель (100 МБ) ..."):
+        with st.spinner("Загружаем модель (около 100 МБ) с Google Диска..."):
             url = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
             gdown.download(url, model_path, quiet=False)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -45,11 +47,12 @@ def load_model():
         in_channels=3,
         classes=1
     ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
     return model, device
 
 def remove_contour(dicom_bytes):
+    """Удаление зелёного контура врача"""
     dcm = pydicom.dcmread(BytesIO(dicom_bytes))
     img = dcm.pixel_array
     if len(img.shape) == 3:
@@ -61,10 +64,10 @@ def remove_contour(dicom_bytes):
     mask_contour = (red_channel < 50).astype(np.uint8) * 255
     kernel = np.ones((3, 3), np.uint8)
     mask_contour = cv2.dilate(mask_contour, kernel, iterations=2)
-    clean = cv2.inpaint(color_img, mask_contour, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
-    return clean
+    return cv2.inpaint(color_img, mask_contour, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 def remove_linear_artifacts(mask, max_aspect_ratio=6):
+    """Удаление артефактных линий"""
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     cleaned_mask = np.zeros_like(mask)
     for i in range(1, num_labels):
@@ -75,30 +78,40 @@ def remove_linear_artifacts(mask, max_aspect_ratio=6):
     return cleaned_mask
 
 def predict_sliding_window(image, model, device):
+    """Скользящее окно (без вложенных st-виджетов)"""
     h, w = image.shape[:2]
     prediction_map = np.zeros((h, w), dtype=np.float32)
     count_map = np.zeros((h, w), dtype=np.float32)
+
+    total_patches_y = (h - PATCH_SIZE) // STRIDE + 1
+    total_patches_x = (w - PATCH_SIZE) // STRIDE + 1
+    total = total_patches_y * total_patches_x
+
+    progress_text = st.empty()
     progress_bar = st.progress(0)
-    total = ((h - PATCH_SIZE) // STRIDE + 1) * ((w - PATCH_SIZE) // STRIDE + 1)
+
     done = 0
     for y in range(0, h - PATCH_SIZE + 1, STRIDE):
         for x in range(0, w - PATCH_SIZE + 1, STRIDE):
-            patch = image[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
-            patch_norm = patch.astype(np.float32) / 255.0
-            patch_norm = (patch_norm - MEAN) / STD
-            patch_tensor = torch.from_numpy(patch_norm).permute(2,0,1).unsqueeze(0).float().to(device)
+            patch = image[y:y+PATCH_SIZE, x:x+PATCH_SIZE].astype(np.float32) / 255.0
+            patch = (patch - MEAN) / STD
+            patch_tensor = torch.from_numpy(patch).permute(2,0,1).unsqueeze(0).float().to(device)
             with torch.no_grad():
                 prob = torch.sigmoid(model(patch_tensor)).cpu().numpy()[0,0]
             prediction_map[y:y+PATCH_SIZE, x:x+PATCH_SIZE] += prob
             count_map[y:y+PATCH_SIZE, x:x+PATCH_SIZE] += 1
             done += 1
             if done % 100 == 0:
+                progress_text.text(f"Инференс: {done}/{total} патчей")
                 progress_bar.progress(min(done / total, 1.0))
+
+    progress_text.empty()
     progress_bar.empty()
     prediction_map = np.divide(prediction_map, count_map, where=count_map>0)
     return prediction_map
 
 def calculate_bsi(pred_mask, h, w):
+    """Расчёт BSI по анатомическим зонам"""
     results = []
     total_pixels = 0
     total_meta = 0
@@ -108,29 +121,31 @@ def calculate_bsi(pred_mask, h, w):
         zone_pixels = (y_end - y_start) * w
         meta_in_zone = np.sum(pred_mask[y_start:y_end, :] > 0)
         bsi = (meta_in_zone / zone_pixels) * 100 if zone_pixels > 0 else 0
-        results.append({'zone': zone_name, 'pixels': int(meta_in_zone), 'bsi': round(bsi, 2)})
+        results.append({
+            'zone': zone_name,
+            'pixels': int(meta_in_zone),
+            'bsi': round(bsi, 2)
+        })
         total_pixels += zone_pixels
         total_meta += meta_in_zone
     total_bsi = round((total_meta / total_pixels) * 100, 2) if total_pixels > 0 else 0
     return results, total_bsi
 
-def create_overlay(image, pred_mask, zone_boundaries):
+def create_overlay(image, pred_mask):
+    """Наложение красной маски и границ зон"""
     h, w = image.shape[:2]
     overlay = image.copy()
-    mask_3d = np.stack([pred_mask/255.0, np.zeros_like(pred_mask), np.zeros_like(pred_mask)], axis=2)
+    mask_3d = np.stack([pred_mask / 255.0, np.zeros_like(pred_mask), np.zeros_like(pred_mask)], axis=2)
     alpha = 0.4
     overlay = (overlay * (1 - alpha) + mask_3d * 255 * alpha).astype(np.uint8)
-    for _, y_start, y_end in zone_boundaries:
+    for name, y_start, y_end in ZONE_BOUNDARIES:
         if y_end is None:
             y_end = h
         cv2.line(overlay, (0, y_start), (w, y_start), (255, 255, 255), 2)
         if y_end < h:
             cv2.line(overlay, (0, y_end), (w, y_end), (255, 255, 255), 2)
-    for zone_name, y_start, y_end in zone_boundaries:
-        if y_end is None:
-            y_end = h
-        y_mid = (y_start + min(y_end, h)) // 2
-        cv2.putText(overlay, zone_name, (5, y_mid), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_mid = (y_start + y_end) // 2
+        cv2.putText(overlay, name, (5, y_mid), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     return overlay
 
 # ========================= ИНТЕРФЕЙС =========================
@@ -156,7 +171,7 @@ with st.sidebar:
     - **Dice (тест):** 0.74 ± 0.08
     - **Чувствительность:** 0.81
     - **Специфичность:** 0.99
-    - **Обучена:** 130 снимков
+    - **Обучающая выборка:** 130 снимков
     """)
 
 uploaded_file = st.file_uploader(
@@ -167,30 +182,33 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
     model, device = load_model()
 
-    # Прогресс обработки
-    with st.spinner("🔬 Идёт анализ снимка..."):
-        dicom_bytes = uploaded_file.read()
-        clean_img = remove_contour(dicom_bytes)
-        h, w = clean_img.shape[:2]
-        right = min(CROP_RIGHT, w - CROP_LEFT - 1)
-        img_cropped = clean_img[CROP_TOP:h-CROP_BOTTOM, CROP_LEFT:w-right]
+    # Чтение и предобработка
+    dicom_bytes = uploaded_file.read()
+    clean_img = remove_contour(dicom_bytes)
+    h, w = clean_img.shape[:2]
+    right = min(CROP_RIGHT, w - CROP_LEFT - 1)
+    img_cropped = clean_img[CROP_TOP:h-CROP_BOTTOM, CROP_LEFT:w-right]
 
-        prob_map = predict_sliding_window(img_cropped, model, device)
+    # Инференс
+    prob_map = predict_sliding_window(img_cropped, model, device)
 
-        pred_mask = (prob_map > threshold).astype(np.uint8) * 255
-        if use_artifact_removal:
-            pred_mask = remove_linear_artifacts(pred_mask)
-        if use_median_filter:
-            pred_mask = cv2.medianBlur(pred_mask, 3)
+    # Постобработка
+    pred_mask = (prob_map > threshold).astype(np.uint8) * 255
+    if use_artifact_removal:
+        pred_mask = remove_linear_artifacts(pred_mask)
+    if use_median_filter:
+        pred_mask = cv2.medianBlur(pred_mask, 3)
 
-        bsi_zones, total_bsi = calculate_bsi(pred_mask, h, w)
+    # BSI
+    bsi_zones, total_bsi = calculate_bsi(pred_mask, h, w)
 
     st.success("✅ Анализ завершён!")
+
     col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("📊 Результат сегментации")
-        overlay = create_overlay(img_cropped, pred_mask, ZONE_BOUNDARIES)
-        st.image(overlay, use_column_width=True, caption="Красный цвет — обнаруженные метастазы")
+        overlay = create_overlay(img_cropped, pred_mask)
+        st.image(overlay, width=None, caption="Красный цвет — обнаруженные метастазы")
         with st.expander("Показать карту вероятностей"):
             fig, ax = plt.subplots()
             im = ax.imshow(prob_map, cmap='hot', vmin=0, vmax=1)
@@ -200,15 +218,33 @@ if uploaded_file is not None:
 
     with col2:
         st.subheader("📋 Протокол BSI")
-        bsi_data = [{"Зона": z['zone'], "BSI": f"{z['bsi']:.2f}%", "Пикселей": z['pixels']} for z in bsi_zones]
+        bsi_data = [
+            {"Зона": z['zone'], "BSI": f"{z['bsi']:.2f}%", "Пикселей": z['pixels']}
+            for z in bsi_zones
+        ]
         st.dataframe(bsi_data, hide_index=True, use_container_width=True)
         color = "red" if total_bsi > 1.0 else "green"
-        st.markdown(f"<h2 style='text-align: center; color: {color};'>Итого: {total_bsi:.2f}%</h2>", unsafe_allow_html=True)
+        st.markdown(
+            f"<h2 style='text-align: center; color: {color};'>Итого: {total_bsi:.2f}%</h2>",
+            unsafe_allow_html=True
+        )
         if export_mask:
             _, mask_encoded = cv2.imencode('.png', pred_mask)
-            st.download_button("💾 Скачать маску (PNG)", mask_encoded.tobytes(), "pred_mask.png", "image/png")
+            st.download_button(
+                "💾 Скачать маску (PNG)",
+                mask_encoded.tobytes(),
+                "pred_mask.png",
+                "image/png"
+            )
         if export_csv:
-            csv_data = "zone,bsi,pixels\n" + "\n".join(f"{z['zone']},{z['bsi']},{z['pixels']}" for z in bsi_zones)
-            st.download_button("📊 Скачать таблицу (CSV)", csv_data, "bsi_report.csv", "text/csv")
+            csv_data = "zone,bsi,pixels\n" + "\n".join(
+                f"{z['zone']},{z['bsi']},{z['pixels']}" for z in bsi_zones
+            )
+            st.download_button(
+                "📊 Скачать таблицу (CSV)",
+                csv_data,
+                "bsi_report.csv",
+                "text/csv"
+            )
 else:
     st.info("👆 Загрузите DICOM-файл, чтобы начать анализ")
