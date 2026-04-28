@@ -9,14 +9,12 @@ from io import BytesIO
 import os
 import gdown
 
-# Настройки страницы
 st.set_page_config(
     page_title="Сегментация костных метастазов",
     page_icon="🏥",
     layout="wide"
 )
 
-# Константы предобработки
 CROP_TOP, CROP_BOTTOM = 30, 50
 CROP_LEFT, CROP_RIGHT = 35, 570
 MEAN = np.array([0.485, 0.456, 0.406])
@@ -31,12 +29,10 @@ ZONE_BOUNDARIES = [
     ('Нижние конечности', 440, None)
 ]
 
-# ID вашей модели на Google Диске
 MODEL_DRIVE_ID = "15vdWpMf86ylUgRV6TiW8xMtGd1cqEyuI"
 
 @st.cache_resource
 def load_model():
-    """Загрузка модели при первом запуске"""
     model_path = "unet_best.pth"
     if not os.path.exists(model_path):
         with st.spinner("Загружаем модель (100 МБ) ..."):
@@ -54,7 +50,6 @@ def load_model():
     return model, device
 
 def remove_contour(dicom_bytes):
-    """Удаление зелёного контура врача"""
     dcm = pydicom.dcmread(BytesIO(dicom_bytes))
     img = dcm.pixel_array
     if len(img.shape) == 3:
@@ -70,7 +65,6 @@ def remove_contour(dicom_bytes):
     return clean
 
 def remove_linear_artifacts(mask, max_aspect_ratio=6):
-    """Удаление артефактных линий"""
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     cleaned_mask = np.zeros_like(mask)
     for i in range(1, num_labels):
@@ -81,7 +75,6 @@ def remove_linear_artifacts(mask, max_aspect_ratio=6):
     return cleaned_mask
 
 def predict_sliding_window(image, model, device):
-    """Скользящее окно"""
     h, w = image.shape[:2]
     prediction_map = np.zeros((h, w), dtype=np.float32)
     count_map = np.zeros((h, w), dtype=np.float32)
@@ -100,13 +93,12 @@ def predict_sliding_window(image, model, device):
             count_map[y:y+PATCH_SIZE, x:x+PATCH_SIZE] += 1
             done += 1
             if done % 100 == 0:
-                progress_bar.progress(done / total)
+                progress_bar.progress(min(done / total, 1.0))
     progress_bar.empty()
     prediction_map = np.divide(prediction_map, count_map, where=count_map>0)
     return prediction_map
 
 def calculate_bsi(pred_mask, h, w):
-    """Расчёт BSI по зонам"""
     results = []
     total_pixels = 0
     total_meta = 0
@@ -123,7 +115,6 @@ def calculate_bsi(pred_mask, h, w):
     return results, total_bsi
 
 def create_overlay(image, pred_mask, zone_boundaries):
-    """Наложение маски и границ зон"""
     h, w = image.shape[:2]
     overlay = image.copy()
     mask_3d = np.stack([pred_mask/255.0, np.zeros_like(pred_mask), np.zeros_like(pred_mask)], axis=2)
@@ -175,41 +166,42 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     model, device = load_model()
-    with st.status("🔬 Анализ снимка...", expanded=True) as status:
-        st.write("📤 Чтение DICOM и удаление контура...")
+
+    # Прогресс обработки
+    with st.spinner("🔬 Идёт анализ снимка..."):
         dicom_bytes = uploaded_file.read()
         clean_img = remove_contour(dicom_bytes)
-        st.write("✂️ Обрезка артефактов...")
         h, w = clean_img.shape[:2]
         right = min(CROP_RIGHT, w - CROP_LEFT - 1)
         img_cropped = clean_img[CROP_TOP:h-CROP_BOTTOM, CROP_LEFT:w-right]
-        st.write("🧠 Инференс U-Net++...")
+
         prob_map = predict_sliding_window(img_cropped, model, device)
-        st.write("📊 Постобработка...")
+
         pred_mask = (prob_map > threshold).astype(np.uint8) * 255
         if use_artifact_removal:
             pred_mask = remove_linear_artifacts(pred_mask)
         if use_median_filter:
             pred_mask = cv2.medianBlur(pred_mask, 3)
-        st.write("📋 Расчёт BSI...")
-        bsi_zones, total_bsi = calculate_bsi(pred_mask, h, w)
-        status.update(label="✅ Анализ завершён!", state="complete")
 
-    col1, col2 = st.columns([2, 1], gap="large")
+        bsi_zones, total_bsi = calculate_bsi(pred_mask, h, w)
+
+    st.success("✅ Анализ завершён!")
+    col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("📊 Результат сегментации")
         overlay = create_overlay(img_cropped, pred_mask, ZONE_BOUNDARIES)
-        st.image(overlay, use_container_width=True, caption="Красный цвет — обнаруженные метастазы")
+        st.image(overlay, use_column_width=True, caption="Красный цвет — обнаруженные метастазы")
         with st.expander("Показать карту вероятностей"):
             fig, ax = plt.subplots()
             im = ax.imshow(prob_map, cmap='hot', vmin=0, vmax=1)
             plt.colorbar(im, ax=ax)
             ax.axis('off')
             st.pyplot(fig)
+
     with col2:
         st.subheader("📋 Протокол BSI")
         bsi_data = [{"Зона": z['zone'], "BSI": f"{z['bsi']:.2f}%", "Пикселей": z['pixels']} for z in bsi_zones]
-        st.dataframe(bsi_data, use_container_width=True, hide_index=True)
+        st.dataframe(bsi_data, hide_index=True, use_container_width=True)
         color = "red" if total_bsi > 1.0 else "green"
         st.markdown(f"<h2 style='text-align: center; color: {color};'>Итого: {total_bsi:.2f}%</h2>", unsafe_allow_html=True)
         if export_mask:
