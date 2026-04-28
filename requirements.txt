@@ -1,4 +1,4 @@
-streamlit==1.32.0
+streamlit==1.38.0
 torch==2.1.2
 segmentation-models-pytorch==0.3.3
 opencv-python-headless==4.8.1.78
